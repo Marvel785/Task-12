@@ -1,0 +1,80 @@
+---
+- name: Setup Container Monitoring for PetClinic Application
+  hosts: localhost
+  connection: local
+  gather_facts: no
+  
+  tasks:
+    - name: Display setup information
+      debug:
+        msg: "Setting up container monitoring for PetClinic Application"
+
+    - name: Generate Prometheus configuration
+      template:
+        src: templates/prometheus.yml.j2
+        dest: ./prometheus.yml
+        mode: '0644'
+        force: yes
+      when: ansible_os_family is defined
+      ignore_errors: yes
+
+    - name: Create basic Prometheus config if template fails
+      copy:
+        dest: ./prometheus.yml
+        mode: '0644'
+        force: yes
+        content: |
+          global:
+            scrape_interval: {{ prometheus_scrape_interval | default('15s') }}
+            evaluation_interval: {{ prometheus_evaluation_interval | default('15s') }}
+
+          scrape_configs:
+            - job_name: 'prometheus'
+              static_configs:
+                - targets: ['localhost:{{ prometheus_port | default(9090) }}']
+
+            - job_name: 'petclinic-app'
+              static_configs:
+                - targets: ['petclinic-app:9200']
+              metrics_path: '{{ petclinic_metrics_path | default("/actuator/prometheus") }}'
+              scrape_interval: 15s
+
+            - job_name: 'mysql'
+              static_configs:
+                - targets: ['mysql-exporter:{{ mysql_exporter_port | default(9104) }}']
+              scrape_interval: 30s
+
+            - job_name: 'docker-containers'
+              static_configs:
+                - targets: ['cadvisor:9200']
+              scrape_interval: 30s
+
+            - job_name: 'grafana'
+              static_configs:
+                - targets: ['grafana:3000']
+              scrape_interval: 30s
+      when: not ansible_check_mode
+
+    - name: Copy Prometheus config to monitoring directory
+      copy:
+        src: ./prometheus.yml
+        dest: ./monitoring/prometheus.yml
+        mode: '0644'
+        force: yes
+      ignore_errors: yes
+
+    - name: Display completion message
+      debug:
+        msg: |
+          Container monitoring setup completed!
+          
+          Generated files:
+          - prometheus.yml (Prometheus configuration)
+          - monitoring/prometheus.yml (backup copy)
+          
+          Next: Run 'docker-compose up -d' to start services
+          
+          Services will be available at:
+          - PetClinic: {{ petclinic_url | default('http://localhost:9200') }}
+          - Grafana: http://localhost:{{ grafana_port | default(3000) }}
+          - Prometheus: http://localhost:{{ prometheus_port | default(9090) }}

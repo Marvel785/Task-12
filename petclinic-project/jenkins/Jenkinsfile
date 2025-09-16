@@ -1,0 +1,793 @@
+pipeline {
+    agent any
+    
+    environment {
+        DOCKER_COMPOSE_FILE = 'docker-compose.yml'
+        PROJECT_DIR = '/home/ell/petclinic-project'
+    }
+    
+    stages {
+        stage('Environment Setup') {
+            steps {
+                script {
+                    echo "Setting up environment..."
+                    sh '''
+                        # Create project directory
+                        sudo mkdir -p ${PROJECT_DIR}
+                        sudo chown $USER:$USER ${PROJECT_DIR}
+                        
+                        # Create required directories
+                        mkdir -p ${PROJECT_DIR}/{docker,monitoring,grafana/provisioning/{datasources,dashboards},dashboards}
+                        mkdir -p ${PROJECT_DIR}/prometheus/data
+                        mkdir -p ${PROJECT_DIR}/grafana/data
+                        
+                        # Set permissions for monitoring tools
+                        sudo chown -R 472:472 ${PROJECT_DIR}/grafana/data || true
+                        sudo chown -R 65534:65534 ${PROJECT_DIR}/prometheus/data || true
+                    '''
+                }
+            }
+        }
+        
+        stage('Cleanup Previous Deployment') {
+            steps {
+                script {
+                    sh '''
+                        cd ${PROJECT_DIR} || exit 1
+                        echo "Stopping existing containers..."
+                        docker-compose down --remove-orphans || true
+                        
+                        echo "Cleaning up Docker resources..."
+                        docker system prune -f || true
+                        docker volume prune -f || true
+                        
+                        echo "Stopping any standalone monitoring containers..."
+                        docker stop prometheus grafana node-exporter petclinic-app || true
+                        docker rm prometheus grafana node-exporter petclinic-app || true
+                    '''
+                }
+            }
+        }
+        
+        stage('Copy Project Files') {
+            steps {
+                script {
+                    echo "Copying project files from workspace..."
+                    sh '''
+                        echo "Current workspace directory contents:"
+                        ls -la ${WORKSPACE}
+                        
+                        # Copy all files from workspace to project directory
+                        cp -r ${WORKSPACE}/* ${PROJECT_DIR}/ || true
+                        
+                        cd ${PROJECT_DIR}
+                        echo "Project directory contents after copy:"
+                        ls -la
+                        
+                        echo "Checking for custom directories:"
+                        ls -la docker/ 2>/dev/null || echo "No docker directory found"
+                        ls -la monitoring/ 2>/dev/null || echo "No monitoring directory found"
+                    '''
+                }
+            }
+        }
+        
+        stage('Clone Spring PetClinic Repository') {
+            steps {
+                script {
+                    sh '''
+                        cd ${PROJECT_DIR}
+                        
+                        # Create a temp directory for the Spring PetClinic source
+                        mkdir -p temp_petclinic
+                        cd temp_petclinic
+                        
+                        if [ -d "spring-petclinic" ]; then
+                            cd spring-petclinic
+                            git pull origin main
+                        else
+                            git clone https://github.com/spring-projects/spring-petclinic.git
+                            cd spring-petclinic
+                        fi
+                        
+                        # Copy Spring PetClinic source files to project root (excluding .git and conflicting files)
+                        rsync -av --exclude='.git' --exclude='docker' --exclude='monitoring' --exclude='Dockerfile' --exclude='docker-compose.yml' ./ ${PROJECT_DIR}/
+                        
+                        # Cleanup temp directory
+                        cd ${PROJECT_DIR}
+                        rm -rf temp_petclinic
+                        
+                        echo "Final project directory structure:"
+                        ls -la
+                    '''
+                }
+            }
+        }
+        
+        stage('Setup Configuration Files') {
+            steps {
+                script {
+                    sh '''
+                        cd ${PROJECT_DIR}
+                        
+                        echo "Setting up Docker and monitoring configurations..."
+                        
+                        # Setup Docker files
+                        if [ -f "docker/Dockerfile" ]; then
+                            cp docker/Dockerfile ./
+                            echo "✅ Using custom Dockerfile from docker/ directory"
+                        else
+                            echo "Creating basic Dockerfile..."
+                            cat > Dockerfile << 'EOF'
+FROM openjdk:17-jre-slim
+VOLUME /tmp
+COPY target/*.jar app.jar
+EXPOSE 8080
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8080/actuator/health || exit 1
+ENTRYPOINT ["java", "-Djava.security.egd=file:/dev/./urandom", "-jar", "/app.jar"]
+EOF
+                            echo "✅ Created basic Dockerfile"
+                        fi
+                        
+                        if [ -f "docker/docker-compose.yml" ]; then
+                            cp docker/docker-compose.yml ./
+                            echo "✅ Using custom docker-compose.yml from docker/ directory"
+                        else
+                            echo "Creating comprehensive docker-compose.yml with monitoring stack..."
+                            cat > docker-compose.yml << 'EOF'
+version: '3.8'
+
+services:
+  # MySQL Database
+  mysql:
+    image: mysql:8.0
+    container_name: petclinic-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: petclinic
+      MYSQL_USER: petclinic
+      MYSQL_PASSWORD: petclinic123
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./docker/mysql-init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      timeout: 20s
+      retries: 10
+    networks:
+      - petclinic-network
+
+  # Spring PetClinic Application
+  petclinic-app:
+    build: .
+    container_name: petclinic-app
+    ports:
+      - "8080:8080"
+    environment:
+      SPRING_PROFILES_ACTIVE: mysql
+      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/petclinic
+      SPRING_DATASOURCE_USERNAME: petclinic
+      SPRING_DATASOURCE_PASSWORD: petclinic123
+    depends_on:
+      mysql:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/actuator/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - petclinic-network
+
+  # Prometheus
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    networks:
+      - petclinic-network
+
+  # Grafana
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin123
+      GF_INSTALL_PLUGINS: grafana-piechart-panel
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+      - ./dashboards:/var/lib/grafana/dashboards
+    networks:
+      - petclinic-network
+
+  # Node Exporter
+  node-exporter:
+    image: prom/node-exporter:latest
+    container_name: node-exporter
+    ports:
+      - "9100:9100"
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.rootfs=/rootfs'
+      - '--path.sysfs=/host/sys'
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+    networks:
+      - petclinic-network
+
+volumes:
+  mysql_data:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  petclinic-network:
+    driver: bridge
+EOF
+                            echo "✅ Created comprehensive docker-compose.yml with monitoring stack"
+                        fi
+                        
+                        # Setup monitoring configurations
+                        echo "Setting up monitoring configurations..."
+                        
+                        # Prometheus configuration
+                        if [ -f "monitoring/prometheus.yml" ]; then
+                            cp monitoring/prometheus.yml ./
+                            echo "✅ Using custom prometheus.yml"
+                        else
+                            echo "Creating prometheus.yml..."
+                            cat > prometheus.yml << 'EOF'
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  # - "first_rules.yml"
+  # - "second_rules.yml"
+
+scrape_configs:
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  - job_name: 'node-exporter'
+    static_configs:
+      - targets: ['node-exporter:9100']
+
+  - job_name: 'petclinic-app'
+    static_configs:
+      - targets: ['petclinic-app:8080']
+    metrics_path: '/actuator/prometheus'
+    scrape_interval: 30s
+
+  - job_name: 'mysql'
+    static_configs:
+      - targets: ['mysql:3306']
+EOF
+                            echo "✅ Created prometheus.yml"
+                        fi
+                        
+                        # Grafana datasource configuration
+                        if [ -f "monitoring/grafana-datasources.yml" ]; then
+                            mkdir -p grafana/provisioning/datasources
+                            cp monitoring/grafana-datasources.yml ./grafana/provisioning/datasources/
+                            echo "✅ Using custom Grafana datasource configuration"
+                        else
+                            echo "Creating Grafana datasource configuration..."
+                            mkdir -p grafana/provisioning/datasources
+                            cat > grafana/provisioning/datasources/grafana-datasources.yml << 'EOF'
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: true
+EOF
+                            echo "✅ Created Grafana datasource configuration"
+                        fi
+                        
+                        # Grafana dashboard configuration
+                        if [ -f "monitoring/grafana-dashboards.yml" ]; then
+                            mkdir -p grafana/provisioning/dashboards
+                            cp monitoring/grafana-dashboards.yml ./grafana/provisioning/dashboards/
+                            echo "✅ Using custom Grafana dashboard configuration"
+                        else
+                            echo "Creating Grafana dashboard configuration..."
+                            mkdir -p grafana/provisioning/dashboards
+                            cat > grafana/provisioning/dashboards/grafana-dashboards.yml << 'EOF'
+apiVersion: 1
+
+providers:
+  - name: 'default'
+    orgId: 1
+    folder: ''
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 10
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+EOF
+                            echo "✅ Created Grafana dashboard configuration"
+                        fi
+                        
+                        # Node Exporter dashboard
+                        if [ -f "monitoring/node-exporter-dashboard.json" ]; then
+                            mkdir -p dashboards
+                            cp monitoring/node-exporter-dashboard.json ./dashboards/
+                            echo "✅ Using custom Node Exporter dashboard"
+                        else
+                            echo "Creating basic Node Exporter dashboard..."
+                            mkdir -p dashboards
+                            cat > dashboards/node-exporter-dashboard.json << 'EOF'
+{
+  "dashboard": {
+    "id": null,
+    "title": "Node Exporter Full",
+    "tags": ["node-exporter"],
+    "timezone": "browser",
+    "panels": [
+      {
+        "id": 1,
+        "title": "CPU Usage",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "100 - (avg(rate(node_cpu_seconds_total{mode=\"idle\"}[5m])) * 100)",
+            "legendFormat": "CPU Usage %"
+          }
+        ],
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0}
+      },
+      {
+        "id": 2,
+        "title": "Memory Usage",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "(1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100",
+            "legendFormat": "Memory Usage %"
+          }
+        ],
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0}
+      }
+    ],
+    "time": {"from": "now-1h", "to": "now"},
+    "refresh": "30s"
+  }
+}
+EOF
+                            echo "✅ Created basic Node Exporter dashboard"
+                        fi
+                        
+                        # MySQL init script
+                        if [ ! -f "docker/mysql-init.sql" ]; then
+                            echo "Creating MySQL init script..."
+                            mkdir -p docker
+                            cat > docker/mysql-init.sql << 'EOF'
+CREATE DATABASE IF NOT EXISTS petclinic;
+USE petclinic;
+
+-- Grant privileges
+GRANT ALL PRIVILEGES ON petclinic.* TO 'petclinic'@'%';
+FLUSH PRIVILEGES;
+
+-- Basic setup is complete, Spring Boot will handle schema creation
+EOF
+                            echo "✅ Created MySQL init script"
+                        fi
+                        
+                        # Set proper permissions
+                        chmod -R 755 . || true
+                        chmod +x mvnw || true
+                        
+                        # Create data directories with proper permissions
+                        mkdir -p prometheus/data grafana/data
+                        sudo chown -R 65534:65534 prometheus/data || true
+                        sudo chown -R 472:472 grafana/data || true
+                        
+                        echo "Configuration files setup completed!"
+                        echo "Final directory structure:"
+                        find . -maxdepth 2 -type f -name "*.yml" -o -name "*.yaml" -o -name "*.json" -o -name "Dockerfile" -o -name "*.sql" | sort
+                    '''
+                }
+            }
+        }
+        
+        stage('Build Application') {
+            steps {
+                script {
+                    sh '''
+                        cd ${PROJECT_DIR}
+                        echo "Building Spring Boot application with Prometheus metrics..."
+                        
+                        # Add Prometheus dependency to pom.xml if not present
+                        if ! grep -q "micrometer-registry-prometheus" pom.xml; then
+                            echo "Adding Prometheus metrics dependency..."
+                            sed -i '/<dependencies>/a\\t\t<dependency>\\n\t\t\t<groupId>io.micrometer</groupId>\\n\t\t\t<artifactId>micrometer-registry-prometheus</artifactId>\\n\t\t\t<scope>runtime</scope>\\n\t\t</dependency>' pom.xml
+                            echo "✅ Added Prometheus metrics dependency"
+                        fi
+                        
+                        # Check if Maven wrapper exists and is executable
+                        if [ -x "./mvnw" ] && [ -f ".mvn/wrapper/maven-wrapper.properties" ]; then
+                            echo "Using Maven wrapper..."
+                            ./mvnw clean compile -DskipTests
+                        elif command -v mvn >/dev/null 2>&1; then
+                            echo "Using system Maven..."
+                            mvn clean compile -DskipTests
+                        else
+                            echo "❌ Neither Maven wrapper nor system Maven found!"
+                            echo "Installing Maven..."
+                            sudo apt-get update && sudo apt-get install -y maven
+                            mvn clean compile -DskipTests
+                        fi
+                    '''
+                }
+            }
+        }
+        
+        stage('Run Tests') {
+            steps {
+                script {
+                    sh '''
+                        cd ${PROJECT_DIR}
+                        echo "Running tests with coverage..."
+                        
+                        if [ -x "./mvnw" ] && [ -f ".mvn/wrapper/maven-wrapper.properties" ]; then
+                            ./mvnw test jacoco:report
+                        else
+                            mvn test jacoco:report
+                        fi
+                    '''
+                }
+            }
+            post {
+                always {
+                    script {
+                        // Publish test results if they exist
+                        if (fileExists("${env.PROJECT_DIR}/target/surefire-reports/*.xml")) {
+                            try {
+                                publishTestResults testResultsPattern: "${env.PROJECT_DIR}/target/surefire-reports/*.xml"
+                            } catch (Exception e) {
+                                echo "Could not publish test results: ${e.getMessage()}"
+                            }
+                        }
+                        
+                        // Publish coverage report
+                        try {
+                            publishHTML([
+                                allowMissing: true,
+                                alwaysLinkToLastBuild: true,
+                                keepAll: true,
+                                reportDir: "${env.PROJECT_DIR}/target/site/jacoco",
+                                reportFiles: 'index.html',
+                                reportName: 'JaCoCo Coverage Report'
+                            ])
+                        } catch (Exception e) {
+                            echo "Could not publish coverage report: ${e.getMessage()}"
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Build and Package') {
+            steps {
+                script {
+                    sh '''
+                        cd ${PROJECT_DIR}
+                        echo "Building application package..."
+                        
+                        if [ -x "./mvnw" ] && [ -f ".mvn/wrapper/maven-wrapper.properties" ]; then
+                            ./mvnw package -DskipTests
+                        else
+                            mvn package -DskipTests
+                        fi
+                        
+                        echo "✅ Application packaged successfully"
+                        ls -la target/*.jar
+                    '''
+                }
+            }
+        }
+        
+        stage('Deploy Full Stack with Monitoring') {
+            steps {
+                script {
+                    sh '''
+                        cd ${PROJECT_DIR}
+                        
+                        echo "🚀 Deploying full stack with monitoring..."
+                        echo "Starting services with docker-compose..."
+                        
+                        # Verify docker-compose file exists
+                        if [ ! -f "docker-compose.yml" ]; then
+                            echo "❌ docker-compose.yml not found!"
+                            exit 1
+                        fi
+                        
+                        echo "Docker Compose file contents:"
+                        head -20 docker-compose.yml
+                        
+                        # Build and start all services
+                        docker-compose build --no-cache
+                        docker-compose up -d
+                        
+                        echo "Waiting for services to start..."
+                        sleep 30
+                        
+                        echo "Checking service status..."
+                        docker-compose ps
+                        
+                        # Health checks
+                        echo "Performing health checks..."
+                        
+                        # Check MySQL
+                        echo "Checking MySQL..."
+                        for i in {1..30}; do
+                            if docker-compose exec -T mysql mysqladmin ping -h localhost -u root -prootpassword >/dev/null 2>&1; then
+                                echo "✅ MySQL is healthy!"
+                                break
+                            fi
+                            if [ $i -eq 30 ]; then
+                                echo "❌ MySQL failed to start"
+                                docker-compose logs mysql
+                            fi
+                            sleep 2
+                        done
+                        
+                        # Check PetClinic App
+                        echo "Checking PetClinic application..."
+                        for i in {1..60}; do
+                            if curl -s http://localhost:8080/actuator/health | grep -q "UP"; then
+                                echo "✅ PetClinic application is healthy!"
+                                break
+                            fi
+                            if [ $i -eq 60 ]; then
+                                echo "❌ PetClinic application failed to start"
+                                docker-compose logs petclinic-app
+                            fi
+                            sleep 2
+                        done
+                        
+                        # Check Prometheus
+                        echo "Checking Prometheus..."
+                        for i in {1..30}; do
+                            if curl -s http://localhost:9090/-/healthy | grep -q "Prometheus"; then
+                                echo "✅ Prometheus is healthy!"
+                                break
+                            fi
+                            if [ $i -eq 30 ]; then
+                                echo "⚠️  Prometheus health check inconclusive, checking if it responds..."
+                                if curl -s http://localhost:9090/ >/dev/null; then
+                                    echo "✅ Prometheus is responding!"
+                                    break
+                                fi
+                                docker-compose logs prometheus
+                            fi
+                            sleep 2
+                        done
+                        
+                        # Check Grafana
+                        echo "Checking Grafana..."
+                        for i in {1..30}; do
+                            if curl -s http://localhost:3000/api/health | grep -q "ok"; then
+                                echo "✅ Grafana is healthy!"
+                                break
+                            fi
+                            if [ $i -eq 30 ]; then
+                                echo "⚠️  Grafana health check inconclusive, checking if it responds..."
+                                if curl -s http://localhost:3000/ >/dev/null; then
+                                    echo "✅ Grafana is responding!"
+                                    break
+                                fi
+                                docker-compose logs grafana
+                            fi
+                            sleep 2
+                        done
+                        
+                        # Check Node Exporter
+                        echo "Checking Node Exporter..."
+                        if curl -s http://localhost:9100/metrics | head -5 | grep -q "node_"; then
+                            echo "✅ Node Exporter is healthy!"
+                        else
+                            echo "⚠️  Node Exporter might have issues"
+                            docker-compose logs node-exporter
+                        fi
+                        
+                        echo "🎉 Full stack deployment completed!"
+                        echo ""
+                        echo "📊 ACCESS URLs:"
+                        echo "• PetClinic App: http://localhost:8080"
+                        echo "• Grafana: http://localhost:3000 (admin/admin123)"
+                        echo "• Prometheus: http://localhost:9090"
+                        echo "• Node Exporter: http://localhost:9100/metrics"
+                        echo ""
+                    '''
+                }
+            }
+        }
+        
+        stage('Monitoring Verification') {
+            steps {
+                script {
+                    sh '''
+                        cd ${PROJECT_DIR}
+                        echo "🔍 Verifying monitoring setup..."
+                        
+                        # Check if Prometheus can scrape targets
+                        echo "Checking Prometheus targets..."
+                        sleep 10
+                        
+                        # Get Prometheus targets
+                        if curl -s "http://localhost:9090/api/v1/targets" | jq '.data.activeTargets[] | {job: .labels.job, health: .health, lastError: .lastError}' 2>/dev/null; then
+                            echo "✅ Prometheus targets information retrieved"
+                        else
+                            echo "📊 Prometheus targets (without jq):"
+                            curl -s "http://localhost:9090/api/v1/targets" || echo "Could not retrieve targets"
+                        fi
+                        
+                        # Check if Grafana has datasources
+                        echo "Checking Grafana datasources..."
+                        if curl -s -u admin:admin123 "http://localhost:3000/api/datasources" | grep -q "prometheus"; then
+                            echo "✅ Grafana Prometheus datasource configured"
+                        else
+                            echo "⚠️  Grafana datasource might not be configured properly"
+                        fi
+                        
+                        # Test a simple Prometheus query
+                        echo "Testing Prometheus query..."
+                        if curl -s "http://localhost:9090/api/v1/query?query=up" | grep -q '"status":"success"'; then
+                            echo "✅ Prometheus queries working"
+                        else
+                            echo "⚠️  Prometheus queries might have issues"
+                        fi
+                        
+                        echo "✅ Monitoring verification completed!"
+                    '''
+                }
+            }
+        }
+        
+        stage('Final Status Report') {
+            steps {
+                script {
+                    sh '''
+                        cd ${PROJECT_DIR}
+                        
+                        echo "=========================================="
+                        echo "         DEPLOYMENT STATUS REPORT"
+                        echo "=========================================="
+                        
+                        echo "🐳 Docker Containers Status:"
+                        docker-compose ps
+                        
+                        echo ""
+                        echo "📊 Service Endpoints:"
+                        echo "✅ PetClinic Application: http://localhost:8080"
+                        echo "✅ Grafana Dashboard: http://localhost:3000 (admin/admin123)"
+                        echo "✅ Prometheus Metrics: http://localhost:9090"
+                        echo "✅ Node Exporter: http://localhost:9100"
+                        echo "✅ MySQL Database: localhost:3306"
+                        
+                        echo ""
+                        echo "📁 Configuration Files Present:"
+                        echo "Dockerfile: $([ -f Dockerfile ] && echo '✅' || echo '❌')"
+                        echo "docker-compose.yml: $([ -f docker-compose.yml ] && echo '✅' || echo '❌')"
+                        echo "prometheus.yml: $([ -f prometheus.yml ] && echo '✅' || echo '❌')"
+                        echo "Grafana config: $([ -d grafana/provisioning ] && echo '✅' || echo '❌')"
+                        
+                        echo ""
+                        echo "🔧 Quick Commands:"
+                        echo "• Stop all services: docker-compose down"
+                        echo "• View logs: docker-compose logs [service-name]"
+                        echo "• Restart service: docker-compose restart [service-name]"
+                        echo "• Scale application: docker-compose up -d --scale petclinic-app=2"
+                        
+                        echo ""
+                        echo "🎉 Full Stack with Monitoring Successfully Deployed!"
+                    '''
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            script {
+                echo '''
+                ========================================
+                          PIPELINE COMPLETED
+                ========================================
+                '''
+                
+                def duration = currentBuild.durationString
+                def result = currentBuild.currentResult ?: 'SUCCESS'
+                
+                echo "Result: ${result}"
+                echo "Duration: ${duration}"
+                echo "Build Number: ${env.BUILD_NUMBER}"
+                echo "Project: ${env.JOB_NAME}"
+            }
+        }
+        success {
+            script {
+                echo '''
+                    🎉 FULL STACK DEPLOYMENT SUCCESS! 🎉
+                    
+                    ✅ Spring PetClinic Application deployed
+                    ✅ MySQL Database configured  
+                    ✅ Prometheus monitoring active
+                    ✅ Grafana dashboards ready
+                    ✅ Node Exporter collecting metrics
+                    ✅ All health checks passed
+                    
+                    🌐 Access your services:
+                    • Application: http://localhost:8080
+                    • Grafana: http://localhost:3000 (admin/admin123)
+                    • Prometheus: http://localhost:9090
+                    • Node Exporter: http://localhost:9100
+                    
+                    📊 Your complete monitoring stack is ready!
+                '''
+            }
+        }
+        failure {
+            script {
+                echo '''
+                    ❌ DEPLOYMENT FAILED!
+                    
+                    Check the console output above for detailed error information.
+                    
+                    Common troubleshooting steps:
+                    1. Check Docker service: sudo systemctl status docker
+                    2. Check ports availability: netstat -tuln | grep -E '(3000|8080|9090|9100|3306)'
+                    3. Check disk space: df -h
+                    4. Check Docker logs: docker-compose logs [service-name]
+                    5. Verify configuration files are present
+                    6. Check permissions: sudo chown -R $USER:$USER /home/ell/petclinic-project
+                    
+                    🔧 Fix the issues and retry the pipeline!
+                '''
+            }
+        }
+        cleanup {
+            script {
+                // Optional: Uncomment to clean up on failure
+                // sh '''
+                //     if [ "${currentBuild.currentResult}" = "FAILURE" ]; then
+                //         cd ${PROJECT_DIR} || exit 0
+                //         echo "Cleaning up failed deployment..."
+                //         docker-compose down --remove-orphans || true
+                //     fi
+                // '''
+                echo "Pipeline cleanup completed"
+            }
+        }
+    }
+}

@@ -1,0 +1,56 @@
+global:
+  scrape_interval: {{ prometheus_scrape_interval | default('15s') }}
+  evaluation_interval: {{ prometheus_evaluation_interval | default('15s') }}
+
+# Alertmanager configuration (optional)
+# alerting:
+#   alertmanagers:
+#     - static_configs:
+#         - targets: []
+
+# Load rules once and periodically evaluate them
+# rule_files:
+#   - "alert_rules.yml"
+
+# Scrape configuration for monitoring targets
+scrape_configs:
+  # Prometheus self-monitoring
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:{{ prometheus_port | default(9090) }}']
+    scrape_interval: 30s
+    metrics_path: /metrics
+
+  # Spring Boot PetClinic Application
+  - job_name: 'petclinic-app'
+    static_configs:
+      - targets: ['petclinic-app:9200']  # Using Docker service name
+    scrape_interval: 15s
+    metrics_path: '{{ petclinic_metrics_path | default("/actuator/prometheus") }}'
+    scrape_timeout: 10s
+
+  # MySQL Database Monitoring (using mysqld-exporter if available)
+  - job_name: 'mysql'
+    static_configs:
+      - targets: ['mysql-exporter:{{ mysql_exporter_port | default(9104) }}']
+    scrape_interval: 30s
+    metrics_path: /metrics
+    # This target will only work if mysql-exporter is added to docker-compose
+
+  # Docker Container Metrics (using cAdvisor if available)
+  - job_name: 'docker-containers'
+    static_configs:
+      - targets: ['cadvisor:8080']
+    scrape_interval: 30s
+    metrics_path: /metrics
+    # This target will only work if cAdvisor is added to docker-compose
+
+  # Grafana self-monitoring
+  - job_name: 'grafana'
+    static_configs:
+      - targets: ['grafana:3000']
+    scrape_interval: 30s
+    metrics_path: /metrics
+
+# Additional configuration for container monitoring
+# You can add more scrape configs here as needed
